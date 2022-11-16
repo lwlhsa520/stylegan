@@ -139,6 +139,7 @@ def setup_training_loop_kwargs(
         data2 = data
 
     args.training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, bbox_dim=bbox_dim, use_labels=True, max_size=None, aug=True)
+    args.training_set1_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data2, bbox_dim=bbox_dim, use_labels=True, max_size=None, aug=True)
     args.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=3, prefetch_factor=2)
     try:
         training_set = dnnlib.util.construct_class_by_name(**args.training_set_kwargs) # subclass of training.dataset.Dataset
@@ -390,9 +391,6 @@ def setup_training_loop_kwargs(
         if not workers >= 1:
             raise UserError('--workers must be at least 1')
         args.data_loader_kwargs.num_workers = workers
-
-    args.training_set1_kwargs = args.training_set_kwargs
-    args.training_set1_kwargs.path=data2
 
     return desc, args
 
