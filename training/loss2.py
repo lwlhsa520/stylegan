@@ -65,7 +65,8 @@ class StyleGAN2Loss(Loss):
                 loss_Gmain = torch.nn.functional.softplus(-gen_logits) # -log(sigmoid(gen_logits))
                 training_stats.report('Loss/G/loss', loss_Gmain)
 
-                recon_loss = self.P(gen_img, real_img) + self.P(gen_mask, real_mask)
+                # recon_loss = self.P(gen_img, real_img) + self.P(gen_mask, real_mask)
+                recon_loss = self.P(gen_mid_mask, F.adaptive_avg_pool2d(real_mask, gen_mid_mask.shape[2:4])) + self.P(gen_mask, real_mask)
                 training_stats.report('Loss/reconloss', recon_loss)
             with torch.autograd.profiler.record_function('Gmain_backward'):
                 (loss_Gmain + recon_loss).mean().mul(gain).backward()
@@ -80,6 +81,7 @@ class StyleGAN2Loss(Loss):
                 with torch.autograd.profiler.record_function('pl_grads'), conv2d_gradfix.no_weight_gradients():
                     pl1, pl2 = torch.autograd.grad(outputs=[(gen_img * pl_noise).sum(), (gen_mask * pl_noise2).sum()], inputs=[gen_ws, gen_ws2], create_graph=True, only_inputs=True)[:2]
                 pl_lengths = torch.cat([pl1, pl2], dim=1).square().sum(2).mean(1).sqrt()
+                # pl_lengths = pl1.square().sum(2).mean(1).sqrt()
                 pl_mean = self.pl_mean.lerp(pl_lengths.mean(), self.pl_decay)
                 self.pl_mean.copy_(pl_mean.detach())
                 pl_penalty = (pl_lengths - pl_mean).square()
