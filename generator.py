@@ -32,7 +32,7 @@ class Gen(torch.nn.Module):
         start = 0
         length = 100
         self.init_seed = 20
-        self.outdir = '../Gen/'
+        self.outdir = '../gen/'
 
         if not os.path.exists(self.outdir):
             os.makedirs(self.outdir)
@@ -43,7 +43,7 @@ class Gen(torch.nn.Module):
         #     os.makedirs(self.outdir+'/masks')
 
         self.path = '../data/dataset3'
-        network_pkl = '../res/stylegan/00003-dataset-auto2-noaug/network-snapshot-001400.pkl'
+        network_pkl = '../res/test/00000-dataset-auto2/network-snapshot-003000.pkl'
         self.device_gpu = torch.device('cuda')
         self.device_cpu = torch.device('cpu')
         self.training_set = ImageFolderDataset(path=self.path, use_labels=False, bbox_dim=128, max_size=None,

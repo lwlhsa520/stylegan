@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from torch_utils import persistence, misc
 from torch_utils.common import tensor_shift
-from torch_utils.custom_ops import _boxes_to_grid
+from torch_utils.custom_ops import _boxes_to_grid, img_resampler
 from torch_utils.ops import grid_sample_gradfix
 from training.networks import SynthesisBlock, normalize_2nd_moment, FullyConnectedLayer, \
     Conv2dLayer, DiscriminatorBlock, DiscriminatorEpilogue, MinibatchStdLayer
@@ -43,12 +43,12 @@ class TransformerLayer(nn.Module):
     # Transformer layer https://arxiv.org/abs/2010.11929 (LayerNorm layers removed for better performance)
     def __init__(self, c, num_heads):
         super().__init__()
-        self.q = FullyConnectedLayer(c, c, bias=False)
-        self.k = FullyConnectedLayer(c, c, bias=False)
-        self.v = FullyConnectedLayer(c, c, bias=False)
+        self.q = nn.Linear(c, c, bias=False)
+        self.k = nn.Linear(c, c, bias=False)
+        self.v = nn.Linear(c, c, bias=False)
         self.ma = nn.MultiheadAttention(embed_dim=c, num_heads=num_heads)
-        self.fc1 = FullyConnectedLayer(c, c, bias=False)
-        self.fc2 = FullyConnectedLayer(c, c, bias=False)
+        self.fc1 = nn.Linear(c, c, bias=False)
+        self.fc2 = nn.Linear(c, c, bias=False)
 
     def forward(self, x):
         x = self.ma(self.q(x), self.k(x), self.v(x))[0] + x
@@ -63,7 +63,7 @@ class TransformerBlock(nn.Module):
         self.conv = None
         if c1 != c2:
             self.conv = Conv2dLayer(c1, c2)
-        self.linear = FullyConnectedLayer(c2, c2)  # learnable position embedding
+        self.linear = nn.Linear(c2, c2)  # learnable position embedding
         self.tr = nn.Sequential(*(TransformerLayer(c2, num_heads) for _ in range(num_layers)))
         self.c2 = c2
 
@@ -285,11 +285,14 @@ class RenderNet(nn.Module):
             block = SynthesisBlock(in_channels, out_channels, w_dim=w_dim, resolution=res,
                                    img_channels=img_channels, mask_channels=1, is_last=is_last, use_fp16=use_fp16, **block_kwargs)
             self.num_ws += block.num_conv
-
-
             if is_last:
                 self.num_ws += block.num_torgb
             setattr(self, f'b{res}', block)
+
+            # if res <= 32:
+            #     tblock = TransformerBlock(out_channels, out_channels, num_heads=4, num_layers=3)
+            #     setattr(self, f'tb{res}', tblock)
+
             # if res < self.mid_size:
             #     fusion = SegEncoder(out_channel=out_channels, in_channel=self.mask_channels)
             #     setattr(self, f'fus{res}', fusion)
@@ -317,14 +320,11 @@ class RenderNet(nn.Module):
 
             block = getattr(self, f'b{res}')
             x, img, mask = block(x, img, mask, cur_ws, **block_kwargs)
-
-            # if res < self.mid_size:
-            #     fusion = getattr(self, f'fus{res}')
-            #     sty_gamma, sty_beta = fusion(F.adaptive_avg_pool2d(x_orig, (res, res)))
-            #     if sty_gamma.ndim<4:
-            #         sty_gamma, sty_beta = sty_gamma.unsqueeze(1), sty_beta.unsqueeze(1)
-            #     # print(sty_gamma.shape, x.shape)
-            #     x = sty_gamma * x + sty_beta
+            # dtype = x.dtype
+            # if res <= 32:
+            #     x = x.to(torch.float32)
+            #     tblock = getattr(self, f'tb{res}')
+            #     x = tblock(x).to(dtype)
         return img, mask
 
 
@@ -333,6 +333,7 @@ class MappingNetwork(torch.nn.Module):
     def __init__(self,
         z_dim,                      # Input latent (Z) dimensionality, 0 = no latent.
         w_dim,                      # Intermediate latent (W) dimensionality.
+        w2_dim,                      # Intermediate latent (W) dimensionality.
         num_ws,                     # Number of intermediate latents to output, None = do not broadcast.
         num_ws2,                    # Number of intermediate latents to output, None = do not broadcast.
         num_layers      = 8,        # Number of mapping layers.
@@ -345,6 +346,7 @@ class MappingNetwork(torch.nn.Module):
         super().__init__()
         self.z_dim = z_dim
         self.w_dim = w_dim
+        self.w2_dim = w2_dim
         self.num_ws = num_ws
         self.num_ws2 = num_ws2
         self.num_layers = num_layers
@@ -352,7 +354,7 @@ class MappingNetwork(torch.nn.Module):
 
         if layer_features is None:
             layer_features = w_dim
-        features_list = [z_dim] + [layer_features] * (num_layers - 1) + [w_dim]
+        features_list = [z_dim] + [layer_features] * (num_layers - 1) + [w_dim + w2_dim]
 
         for idx in range(num_layers):
             in_features = features_list[idx]
@@ -362,6 +364,7 @@ class MappingNetwork(torch.nn.Module):
 
         if num_ws is not None and w_avg_beta is not None:
             self.register_buffer('w_avg', torch.zeros([w_dim]))
+            self.register_buffer('w_avg2', torch.zeros([w2_dim]))
 
     def forward(self, z, truncation_psi=1, truncation_cutoff=None, skip_w_avg_update=False):
         # Embed, normalize, and concat inputs.
@@ -377,25 +380,31 @@ class MappingNetwork(torch.nn.Module):
             layer = getattr(self, f'fc{idx}')
             x = layer(x)
 
+        y, x = x[:, :self.w_dim], x[:, self.w_dim:]
+
         # Update moving average of W.
         if self.w_avg_beta is not None and self.training and not skip_w_avg_update:
             with torch.autograd.profiler.record_function('update_w_avg'):
-                self.w_avg.copy_(x.detach().mean(dim=0).lerp(self.w_avg, self.w_avg_beta))
+                self.w_avg.copy_(y.detach().mean(dim=0).lerp(self.w_avg, self.w_avg_beta))
+                self.w_avg2.copy_(x.detach().mean(dim=0).lerp(self.w_avg2, self.w_avg_beta))
 
         # Broadcast.
         if self.num_ws is not None:
             with torch.autograd.profiler.record_function('broadcast'):
-                x = x.unsqueeze(1).repeat([1, self.num_ws + self.num_ws2, 1])
+                y = y.unsqueeze(1).repeat([1, self.num_ws, 1])
+                x = x.unsqueeze(1).repeat([1, self.num_ws2, 1])
 
         # Apply truncation.
         if truncation_psi != 1:
             with torch.autograd.profiler.record_function('truncate'):
                 assert self.w_avg_beta is not None
                 if self.num_ws is None or truncation_cutoff is None:
-                    x = self.w_avg.lerp(x, truncation_psi)
+                    y = self.w_avg.lerp(y, truncation_psi)
+                    x = self.w_avg2.lerp(x, truncation_psi)
                 else:
-                    x[:, :truncation_cutoff] = self.w_avg.lerp(x[:, :truncation_cutoff], truncation_psi)
-        return x[:, :self.num_ws], x[:, self.num_ws:]
+                    y[:, :truncation_cutoff] = self.w_avg.lerp(y[:, :truncation_cutoff], truncation_psi)
+                    x[:, :truncation_cutoff] = self.w_avg2.lerp(x[:, :truncation_cutoff], truncation_psi)
+        return y, x
 
 #----------------------------------------------------------------------------
 
@@ -404,6 +413,7 @@ class SimGenerator(nn.Module):
     def __init__(self,
                 z_dim = 512,
                 w_dim = 512,
+                w2_dim = 512,
                 img_resolution = 256,
                 img_channels = 1,
                 bbox_dim = 128,
@@ -419,6 +429,7 @@ class SimGenerator(nn.Module):
         self.img_resolution = img_resolution
         self.z_dim = z_dim
         self.w_dim = w_dim
+        self.w_dim = w_dim
         self.bbox_dim = bbox_dim
         self.log_size = int(math.log(img_resolution, 2))
         self.img_channels = img_channels
@@ -427,19 +438,20 @@ class SimGenerator(nn.Module):
         self.single_size = single_size
         self.gen_single = LocalGenerator(w_dim=w_dim, img_resolution=self.single_size, img_channels=1, **synthesis_kwargs)
         self.num_ws = self.gen_single.num_ws
-        self.render_net = RenderNet(w_dim=w_dim,  in_resolution=min_feat_size, img_resolution=img_resolution, img_channels=img_channels, mask_channels=self.bbox_dim, mid_size=mid_size, mid_channels=128, **synthesis_kwargs)
-        self.mapping = MappingNetwork(z_dim=z_dim, w_dim=w_dim, num_ws=self.num_ws, num_ws2=self.render_net.num_ws, **mapping_kwargs)
+        self.render_net = RenderNet(w_dim=w2_dim,  in_resolution=min_feat_size, img_resolution=img_resolution, img_channels=img_channels, mask_channels=self.bbox_dim, mid_size=mid_size, mid_channels=128, **synthesis_kwargs)
+        self.num_ws2 = self.render_net.num_ws
+        self.mapping = MappingNetwork(z_dim=z_dim, w_dim=w_dim, w2_dim=w2_dim, num_ws=self.num_ws,  num_ws2=self.num_ws2, **mapping_kwargs)
 
     def forward(self, z, bbox, truncation_psi=1, truncation_cutoff=None):
         misc.assert_shape(bbox, [None, self.bbox_dim, 4])
-        ws, ws2 = self.mapping(z, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
-        sin_m = (self.gen_single(ws) + 1.0) / 2.0 # adjust from [-1, 1] to [0, 1]
+        ws1, ws2 = self.mapping(z, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
+        sin_m = (self.gen_single(ws1) + 1.0) / 2.0 # adjust from [-1, 1] to [0, 1]
         sin_ms = sin_m.repeat(1, self.bbox_dim, 1, 1).view(-1,  1,  self.single_size, self.single_size)
         grid = _boxes_to_grid(bbox.view(-1, 4), self.mid_size, self.mid_size).to(sin_ms.dtype)
         mid_masks = grid_sample_gradfix.grid_sample(sin_ms, grid).view(-1, self.bbox_dim, self.mid_size, self.mid_size)
         # mid_masks = mid_masks.mul(2.0) - 1.0 # [0, 1]adjust to [-1, 1]
         img, mask = self.render_net(mid_masks.mul(2.0) - 1.0, ws2)
-        return img, mask, ws, ws2, mid_masks.sum(dim=1, keepdim=True).clamp(max=1).mul(2.0) - 1.0
+        return img, mask, ws1, ws2, mid_masks.sum(dim=1, keepdim=True).clamp(max=1).mul(2.0) - 1.0
 
 #----------------------------------------------------------------------------
 
@@ -461,12 +473,15 @@ class DualDiscriminator(torch.nn.Module):
         super().__init__()
         self.img_resolution = img_resolution
         self.img_resolution_log2 = int(np.log2(img_resolution))
+        self.sin_img_resolution_log2 = int(np.log2(32))
         self.img_channels = img_channels
         self.mask_channels = mask_channels
         self.block_resolutions = [2 ** i for i in range(self.img_resolution_log2, 2, -1)]
+        self.sin_block_resolutions = [2 ** i for i in range(self.sin_img_resolution_log2, 2, -1)]
         channels_dict = {res: min(channel_base // res, channel_max) for res in self.block_resolutions + [4]}
         fp16_resolution = max(2 ** (self.img_resolution_log2 + 1 - num_fp16_res), 8)
 
+        print(self.sin_block_resolutions)
         common_kwargs = dict(architecture=architecture, conv_clamp=conv_clamp)
         cur_layer_idx = 0
         cur_layer_idx2 = 0
@@ -475,35 +490,24 @@ class DualDiscriminator(torch.nn.Module):
             tmp_channels = channels_dict[res]
             out_channels = channels_dict[res // 2]
             use_fp16 = (res >= fp16_resolution)
+
             block = DiscriminatorBlock(in_channels, tmp_channels, out_channels, resolution=res, img_channels=img_channels,
                 first_layer_idx=cur_layer_idx, use_fp16=use_fp16, **block_kwargs, **common_kwargs)
             setattr(self, f'b{res}', block)
             cur_layer_idx += block.num_layers
 
-            # block2 = DiscriminatorBlock(in_channels, tmp_channels, out_channels, resolution=res, img_channels=mask_channels,
-            #     first_layer_idx=cur_layer_idx2, use_fp16=use_fp16, **block_kwargs, **common_kwargs)
-            # setattr(self, f'mb{res}', block2)
-            # cur_layer_idx2 += block2.num_layers
-
-        self.b4 = DiscriminatorEpilogue(channels_dict[4], resolution=4, **epilogue_kwargs, **common_kwargs)
+        self.b4 = DiscriminatorEpilogue(channels_dict[4], resolution=4, getVec=False, **epilogue_kwargs, **common_kwargs)
         # self.out = FullyConnectedLayer(channels_dict[4], 1)
 
-    def forward(self, img, mask, getVec=True, **block_kwargs):
+    def forward(self, img, mask, **block_kwargs):
         x = None
         y = None
         for res in self.block_resolutions:
             block = getattr(self, f'b{res}')
             x, img = block(x, img, **block_kwargs)
 
-            # block2 = getattr(self, f'mb{res}')
-            # y, mask = block2(y, mask, **block_kwargs)
-        x = self.b4(x)
-        # digit = self.out(x)
-        # if getVec:
-        #     return x, digit
-        # else:
-        #     return digit
-        return x
+        res = self.b4(x)
+        return res
 
 
 if __name__ == "__main__":

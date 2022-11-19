@@ -166,10 +166,10 @@ def ReversibleAugment(image, mask, bbox):
     if p[1]:
         image, mask, bbox = VerticalFlip(image, mask, bbox)
         # print("p1", image.shape, mask.shape)
-    # if p[2]:
-    #    locate = tuple(0.25 + 0.0625 * np.random.randint(0, 8, 2))
-    #    image, mask, bbox = cropAndresize(image, mask, bbox, locate=locate)
-    #    # print("p2", image.shape, mask.shape)
+    if p[2]:
+       locate = tuple(0.25 + 0.0625 * np.random.randint(0, 8, 2))
+       image, mask, bbox = cropAndresize(image, mask, bbox, locate=locate)
+       # print("p2", image.shape, mask.shape)
     if p[3]:
         times = np.random.randint(0, 4, 1)
         image, mask, bbox = rot90(image, mask, bbox, times=times)

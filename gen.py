@@ -54,7 +54,7 @@ if __name__ == "__main__":
     bboxs = bbox.to(device)
     # y = labels[:, :, 0].to(torch.uint8).to(device)
 
-    network_pkl = '../res/stylegan/00004-dataset-auto1-noaug/network-snapshot-001000.pkl'
+    network_pkl = '../res/test/00000-dataset-auto2/network-snapshot-003000.pkl'
     # network_pkl = '../res/stylegan/00005-dataset-auto1-noaug/network-snapshot-000800.pkl'
     # network_pkl = '../res/stylegan/stylegan_init/00100-dataset-auto1-batch8/network-snapshot-000600.pkl'
     with dnnlib.util.open_url(network_pkl) as f:
