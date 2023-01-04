@@ -24,6 +24,8 @@ from torch.utils.file_baton import FileBaton
 # Global options.
 from torchvision import transforms
 
+from torch_utils.aug_util import xywh2x0y0x1y1
+
 verbosity = 'brief' # Verbosity level: 'none', 'brief', 'full'
 
 #----------------------------------------------------------------------------
@@ -286,27 +288,31 @@ def batch_Mask2bbox(bmasks, res = 256, resample=8):
 
 #-------------------------------------------------------------------------------------
 
-def img_resampler(img, bbox, resample_num=16, imgs_size=32):
+def img_resampler(img, bbox, resample_num=16, real_img=None, imgs_size=32):
     B, C, H, W = img.shape
-    bbox = bbox * (W-1) # x0, y0, w, h
+    bbox = bbox * (W-1) # x, y, w, h
     bi, ni = torch.where((bbox[:, :, 2] * bbox[:, :, 3])> 0)
     bc = np.array([len(bi[bi == b]) for b in range(img.shape[0])]) # batch count
     rs = torch.cat([torch.randint(bc[:i].sum(), bc[:i+1].sum(), [resample_num]) for i in range(bbox.shape[0])]) # resample
 
     bbox2 = bbox[bi[rs], ni[rs]]
-    bbox2[:, 2] = bbox2[:, 2] + bbox2[:, 0]
-    bbox2[:, 3] = bbox2[:, 3] + bbox2[:, 1]
+    bbox2 = xywh2x0y0x1y1(bbox2)
     bbox2 = bbox2.clamp(0, 255).to(torch.uint8)
 
-    new_img = img.view(B, 1, C, H, W).repeat(1, resample_num, 1,  1,  1)
-    new_img = new_img.view(B * resample_num, C, H, W)
-
     ims = torch.zeros([B * resample_num, C, imgs_size, imgs_size], device=img.device)
+    r_ims = torch.zeros([B * resample_num, C, imgs_size, imgs_size], device=img.device)
+
     transform = transforms.Resize([imgs_size, imgs_size])
 
-    for idx, (im, box) in enumerate(zip(new_img, bbox2)):
+    for idx, (im, box) in enumerate(zip(img, bbox2)):
         ims[idx] = transform(im[:, box[0]:box[2], box[1]:box[3]])
 
+    if real_img is not None:
+        for idx, (r_im, box) in enumerate(zip(real_img, bbox2)):
+            r_ims[idx] = transform(r_im[:, box[0]:box[2], box[1]:box[3]])
+
+        return ims, r_ims
     # return ims.view(B, resample_num, C, imgs_size, imgs_size)
 
     return ims
+
