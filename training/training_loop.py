@@ -151,7 +151,7 @@ def training_loop(
         z = torch.empty([batch_gpu, G.z_dim], device=device)
         bbox = torch.from_numpy(training_set[0][2]).unsqueeze(0).repeat(batch_gpu, 1, 1).to(device)
         img, mask, _, _, _ = misc.print_module_summary(G, [z, bbox])
-        misc.print_module_summary(D, [img, mask, bbox])
+        misc.print_module_summary(D, [img, mask])
 
     # Setup augmentation.
     if rank == 0:
@@ -169,7 +169,7 @@ def training_loop(
         print(f'Distributing across {num_gpus} GPUs...')
     ddp_modules = dict()
     # for name, module in [('G', G), ('Dsr', D.SRnet), ('Dm', D.Mnet), (None, G_ema), ('augment_pipe', augment_pipe), ('P', Perceptual)]:
-    for name, module in [('G', G), ('Ds', D.Snet),  ('Dm', D.Mnet),  (None, G_ema), ('augment_pipe', augment_pipe), ('P', Perceptual)]:
+    for name, module in [('G', G), ('D', D),  (None, G_ema), ('augment_pipe', augment_pipe), ('P', Perceptual)]:
         if (num_gpus > 1) and (module is not None) and len(list(module.parameters())) != 0:
             module.requires_grad_(True)
             module = torch.nn.parallel.DistributedDataParallel(module, device_ids=[device], broadcast_buffers=False)

@@ -615,28 +615,13 @@ class Discriminator(torch.nn.Module):
             epilogue_kwargs=epilogue_kwargs
         )
 
-        self.Snet = DualDiscriminator(
-            img_resolution=32,
-            img_channels=img_channels,
-            mask_channels=mask_channels,
-            architecture=architecture,
-            channel_base=channel_base,
-            channel_max=channel_max,
-            num_fp16_res=num_fp16_res,
-            conv_clamp=conv_clamp,
-            single=True,
-            block_kwargs=block_kwargs,
-            mapping_kwargs=mapping_kwargs,
-            epilogue_kwargs=epilogue_kwargs
-        )
 
 
-    def forward(self, img, mask, bbox, **block_kwargs):
+    def forward(self, img, mask, **block_kwargs):
         # img = self.SRnet(img)
         d1 = self.Mnet(img = img, mask = mask, **block_kwargs)
-        samples = img_resampler(img, bbox, resample_num=16) # (B*16, C, H, W)
-        d2 = self.Snet(img=samples, **block_kwargs).view(img.shape[0], 16, 1).mean(1)
-        return d1, d2
+
+        return d1
 
 if __name__ == "__main__":
     x = torch.randn([4, 1, 256, 256])
