@@ -177,6 +177,15 @@ def ReversibleAugment(image, mask, bbox):
 
     return image, mask, bbox, ops
 
+def bboxSort(bbox):
+    new_bbox = np.zeros([bbox.shape[0], 6])
+    new_bbox[:, 2:] = bbox.copy()
+    new_bbox[:, 0] = np.where(new_bbox[:, 4]<new_bbox[:, 5], new_bbox[:, 4]/new_bbox[:, 5], new_bbox[:, 5]/new_bbox[:, 4])
+    new_bbox = new_bbox[new_bbox[:, 0]>0.3]
+    new_bbox = new_bbox[np.argsort(-new_bbox[:, 0])]
+    new_bbox = new_bbox[:, 2:]
+    return new_bbox
+
 class Dataset(torch.utils.data.Dataset):
     def __init__(self,
         name,                   # Name of the dataset.
@@ -298,8 +307,10 @@ class Dataset(torch.utils.data.Dataset):
         bbox = x0y0wh2xywh(bbox)
         if self.aug:
             image, mask, bbox, ops = ReversibleAugment(image, mask, bbox)
-        bbox = bbox[((bbox[:, 2] > 0.05) * (bbox[:, 3] > 0.05))]
+        bbox = bbox[((bbox[:, 2] * bbox[:, 3]) > 0)]
+
         # bbox = xywh2x0y0wh(bbox)
+        bbox = bboxSort(bbox)
 
         image = image.transpose(2, 0, 1)
         mask = mask.transpose(2, 0, 1)
@@ -466,7 +477,7 @@ class ImageFolderDataset(Dataset):
         if bbox.shape[1] !=5:
             bbox = np.zeros([0, 5])
 
-        bbox = bbox[((bbox[:, 3] > 0) * (bbox[:, 4] > 0))]
+        bbox = bbox[((bbox[:, 3]*bbox[:, 4]) > 0)]
 
         return bbox[:, 1:]
 
