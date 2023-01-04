@@ -33,7 +33,7 @@ if __name__ == "__main__":
     device = torch.device('cuda')
     device2 = torch.device('cpu')
 
-    training_set = ImageFolderDataset(path='../data/dataset3', use_labels=False, bbox_dim=128, max_size=None, xflip=False, aug=False)
+    training_set = ImageFolderDataset(path='../data/dataset', use_labels=False, bbox_dim=128, max_size=None, xflip=False, aug=False)
     dataloader = iter(torch.utils.data.DataLoader(dataset=training_set, batch_size=batch_size, pin_memory=True, num_workers=3, prefetch_factor=2))
 
     C, H, W = training_set[0][0].shape
@@ -41,14 +41,14 @@ if __name__ == "__main__":
     # canvas = PIL.Image.new('RGB', (W * (len(col_seeds) + 1), H * (len(row_seeds) + 1)), 'black')
     canvas = PIL.Image.new('L', (W * 9, H * batch_size), 'black')
     canvas_s = PIL.Image.new('L', (256 * 5, 256 * batch_size), 'black')
-    for _ in range(233):
+    for _ in range(23):
         next(dataloader)
     images, masks, bbox = next(dataloader)
 
     imgs = images.to(device).to(torch.float32) / 127.5 - 1
     bboxs = bbox.to(device)
 
-    network_pkl = '../res/stylegan/00004-dataset-auto1-noaug/network-snapshot-001000.pkl'
+    network_pkl = '../res/test/00000-dataset4-auto1/network-snapshot-000800.pkl'
     #network_pkl = '../res/stylegan/00005-dataset-auto1-noaug/network-snapshot-000800.pkl'
     with dnnlib.util.open_url(network_pkl) as f:
         G = legacy.load_network_pkl(f)['G_ema'].to(device)

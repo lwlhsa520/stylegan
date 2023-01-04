@@ -10,7 +10,7 @@ from torch_utils.common import tensor_shift
 from torch_utils.custom_ops import _boxes_to_grid, img_resampler
 from torch_utils.ops import grid_sample_gradfix
 from training.networks import SynthesisBlock, normalize_2nd_moment, FullyConnectedLayer, \
-    Conv2dLayer, DiscriminatorBlock, DiscriminatorEpilogue, MinibatchStdLayer
+    Conv2dLayer, DiscriminatorBlock, DiscriminatorEpilogue, MinibatchStdLayer, ToRGBLayer
 
 
 @persistence.persistent_class
@@ -333,7 +333,7 @@ class MappingNetwork(torch.nn.Module):
     def __init__(self,
         z_dim,                      # Input latent (Z) dimensionality, 0 = no latent.
         w_dim,                      # Intermediate latent (W) dimensionality.
-        w2_dim,                      # Intermediate latent (W) dimensionality.
+        # w2_dim,                      # Intermediate latent (W) dimensionality.
         num_ws,                     # Number of intermediate latents to output, None = do not broadcast.
         num_ws2,                    # Number of intermediate latents to output, None = do not broadcast.
         num_layers      = 8,        # Number of mapping layers.
@@ -346,7 +346,7 @@ class MappingNetwork(torch.nn.Module):
         super().__init__()
         self.z_dim = z_dim
         self.w_dim = w_dim
-        self.w2_dim = w2_dim
+        # self.w2_dim = w2_dim
         self.num_ws = num_ws
         self.num_ws2 = num_ws2
         self.num_layers = num_layers
@@ -354,7 +354,7 @@ class MappingNetwork(torch.nn.Module):
 
         if layer_features is None:
             layer_features = w_dim
-        features_list = [z_dim] + [layer_features] * (num_layers - 1) + [w_dim + w2_dim]
+        features_list = [z_dim] + [layer_features] * (num_layers - 1) + [w_dim]
 
         for idx in range(num_layers):
             in_features = features_list[idx]
@@ -364,7 +364,6 @@ class MappingNetwork(torch.nn.Module):
 
         if num_ws is not None and w_avg_beta is not None:
             self.register_buffer('w_avg', torch.zeros([w_dim]))
-            self.register_buffer('w_avg2', torch.zeros([w2_dim]))
 
     def forward(self, z, truncation_psi=1, truncation_cutoff=None, skip_w_avg_update=False):
         # Embed, normalize, and concat inputs.
@@ -380,31 +379,26 @@ class MappingNetwork(torch.nn.Module):
             layer = getattr(self, f'fc{idx}')
             x = layer(x)
 
-        y, x = x[:, :self.w_dim], x[:, self.w_dim:]
 
         # Update moving average of W.
         if self.w_avg_beta is not None and self.training and not skip_w_avg_update:
             with torch.autograd.profiler.record_function('update_w_avg'):
-                self.w_avg.copy_(y.detach().mean(dim=0).lerp(self.w_avg, self.w_avg_beta))
-                self.w_avg2.copy_(x.detach().mean(dim=0).lerp(self.w_avg2, self.w_avg_beta))
+                self.w_avg.copy_(x.detach().mean(dim=0).lerp(self.w_avg, self.w_avg_beta))
 
         # Broadcast.
         if self.num_ws is not None:
             with torch.autograd.profiler.record_function('broadcast'):
-                y = y.unsqueeze(1).repeat([1, self.num_ws, 1])
-                x = x.unsqueeze(1).repeat([1, self.num_ws2, 1])
+                x = x.unsqueeze(1).repeat([1, self.num_ws + self.num_ws2, 1])
 
         # Apply truncation.
         if truncation_psi != 1:
             with torch.autograd.profiler.record_function('truncate'):
                 assert self.w_avg_beta is not None
                 if self.num_ws is None or truncation_cutoff is None:
-                    y = self.w_avg.lerp(y, truncation_psi)
-                    x = self.w_avg2.lerp(x, truncation_psi)
+                    x = self.w_avg.lerp(x, truncation_psi)
                 else:
-                    y[:, :truncation_cutoff] = self.w_avg.lerp(y[:, :truncation_cutoff], truncation_psi)
-                    x[:, :truncation_cutoff] = self.w_avg2.lerp(x[:, :truncation_cutoff], truncation_psi)
-        return y, x
+                    x[:, :truncation_cutoff] = self.w_avg.lerp(x[:, :truncation_cutoff], truncation_psi)
+        return x[:, :self.num_ws], x[:, self.num_ws:]
 
 #----------------------------------------------------------------------------
 
@@ -438,9 +432,11 @@ class SimGenerator(nn.Module):
         self.single_size = single_size
         self.gen_single = LocalGenerator(w_dim=w_dim, img_resolution=self.single_size, img_channels=1, **synthesis_kwargs)
         self.num_ws = self.gen_single.num_ws
-        self.render_net = RenderNet(w_dim=w2_dim,  in_resolution=min_feat_size, img_resolution=img_resolution, img_channels=img_channels, mask_channels=self.bbox_dim, mid_size=mid_size, mid_channels=128, **synthesis_kwargs)
+        self.render_net = RenderNet(w_dim=w_dim,  in_resolution=min_feat_size, img_resolution=img_resolution, img_channels=img_channels, mask_channels=self.bbox_dim, mid_size=mid_size, mid_channels=bbox_dim, **synthesis_kwargs)
         self.num_ws2 = self.render_net.num_ws
-        self.mapping = MappingNetwork(z_dim=z_dim, w_dim=w_dim, w2_dim=w2_dim, num_ws=self.num_ws,  num_ws2=self.num_ws2, **mapping_kwargs)
+        self.mapping = MappingNetwork(z_dim=z_dim, w_dim=w_dim, num_ws=self.num_ws,  num_ws2=self.num_ws2, **mapping_kwargs)
+
+        # self.SRnet = MiddleModule(img_resolution=img_resolution, img_channels=img_channels)
 
     def forward(self, z, bbox, truncation_psi=1, truncation_cutoff=None):
         misc.assert_shape(bbox, [None, self.bbox_dim, 4])
@@ -451,10 +447,80 @@ class SimGenerator(nn.Module):
         mid_masks = grid_sample_gradfix.grid_sample(sin_ms, grid).view(-1, self.bbox_dim, self.mid_size, self.mid_size)
         # mid_masks = mid_masks.mul(2.0) - 1.0 # [0, 1]adjust to [-1, 1]
         img, mask = self.render_net(mid_masks.mul(2.0) - 1.0, ws2)
+        # img = self.SRnet(img)
         return img, mask, ws1, ws2, mid_masks.sum(dim=1, keepdim=True).clamp(max=1).mul(2.0) - 1.0
 
 #----------------------------------------------------------------------------
+class ResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, up=1, down=1):
+        super().__init__()
+        self.conv0 = Conv2dLayer(in_channels, out_channels, kernel_size=3, up=up, down=down)
+        self.conv1 = Conv2dLayer(out_channels, out_channels, kernel_size=3)
+        self.skip = Conv2dLayer(in_channels, out_channels, kernel_size=1, up=up, down=down)
 
+    def forward(self, x):
+        return self.skip(x, gain=np.sqrt(0.5)) + self.conv1(self.conv0(x), gain=np.sqrt(0.5))
+
+
+@persistence.persistent_class
+class MiddleModule(torch.nn.Module):
+    def __init__(self,
+                 img_resolution,
+                 img_channels,
+                 channel_base = 32768,
+                 channel_max = 512,
+                 ):
+        super().__init__()
+        self.img_resolution = img_resolution
+        self.img_channels = img_channels
+        self.middle_resolution = 64
+        self.channel_base = channel_base
+        self.channel_max = channel_max
+        self.img_resolution_log2 = int(np.log2(self.img_resolution))
+        self.middle_resolution_log2 = int(np.log2(self.middle_resolution))
+        self.block_resolutions = [2 ** i for i in range(self.img_resolution_log2, self.middle_resolution_log2-1, -1)]
+        channels_dict = {res: min(self.channel_base // res, self.channel_max) for res in self.block_resolutions + [self.middle_resolution]}
+        self.down = nn.ModuleList([Conv2dLayer(self.img_channels, channels_dict[self.img_resolution], kernel_size=3)])
+
+        for res in self.block_resolutions[:-1:]:
+            print(res)
+            in_channels = channels_dict[res]
+            out_channels = channels_dict[res // 2]
+            self.down.append(ResBlock(in_channels, out_channels, down=2))
+
+        self.middle = ResBlock(channels_dict[self.middle_resolution], channels_dict[self.middle_resolution])
+
+        self.up = nn.ModuleList([])
+
+        for res in self.block_resolutions[:0:-1]:
+            in_channels = channels_dict[res] * 2
+            out_channels = channels_dict[res * 2]
+            self.up.append(ResBlock(in_channels, out_channels, up=2))
+
+
+        self.out = nn.Sequential(
+            Conv2dLayer(channels_dict[self.img_resolution]*2, channels_dict[self.img_resolution], kernel_size=1),
+            ToRGBLayer(channels_dict[self.img_resolution], self.img_channels)
+        )
+
+    def forward(self, x):
+
+        input_map = []
+        for net in self.down:
+            x = net(x)
+            input_map.append(x)
+
+        x = self.middle(x)
+        for net in self.up:
+            x = torch.cat([x, input_map.pop(-1)], dim=1)
+            x = net(x)
+
+        x = torch.cat([x, input_map.pop(-1)], dim=1)
+
+        x = self.out(x)
+        return x
+
+#----------------------------------------------------------------------------
 @persistence.persistent_class
 class DualDiscriminator(torch.nn.Module):
     def __init__(self,
@@ -466,6 +532,7 @@ class DualDiscriminator(torch.nn.Module):
         channel_max         = 512,      # Maximum number of channels in any layer.
         num_fp16_res        = 0,        # Use FP16 for the N highest resolutions.
         conv_clamp          = None,     # Clamp the output of convolution layers to +-X, None = disable clamping.
+        single                = False,     # Clamp the output of convolution layers to +-X, None = disable clamping.
         block_kwargs        = {},       # Arguments for DiscriminatorBlock.
         mapping_kwargs      = {},       # Arguments for MappingNetwork.
         epilogue_kwargs     = {},       # Arguments for DiscriminatorEpilogue.
@@ -476,12 +543,13 @@ class DualDiscriminator(torch.nn.Module):
         self.sin_img_resolution_log2 = int(np.log2(32))
         self.img_channels = img_channels
         self.mask_channels = mask_channels
+        self.single = single
         self.block_resolutions = [2 ** i for i in range(self.img_resolution_log2, 2, -1)]
         self.sin_block_resolutions = [2 ** i for i in range(self.sin_img_resolution_log2, 2, -1)]
         channels_dict = {res: min(channel_base // res, channel_max) for res in self.block_resolutions + [4]}
         fp16_resolution = max(2 ** (self.img_resolution_log2 + 1 - num_fp16_res), 8)
 
-        print(self.sin_block_resolutions)
+
         common_kwargs = dict(architecture=architecture, conv_clamp=conv_clamp)
         cur_layer_idx = 0
         cur_layer_idx2 = 0
@@ -497,33 +565,82 @@ class DualDiscriminator(torch.nn.Module):
             cur_layer_idx += block.num_layers
 
         self.b4 = DiscriminatorEpilogue(channels_dict[4], resolution=4, getVec=False, **epilogue_kwargs, **common_kwargs)
+
+        if self.single:
+            self.tanh = torch.nn.Tanh()
         # self.out = FullyConnectedLayer(channels_dict[4], 1)
 
-    def forward(self, img, mask, **block_kwargs):
+    def forward(self, img, mask=None, **block_kwargs):
         x = None
         y = None
+
         for res in self.block_resolutions:
             block = getattr(self, f'b{res}')
             x, img = block(x, img, **block_kwargs)
 
-        res = self.b4(x)
-        return res
+        x = self.b4(x)
 
+        if self.single:
+            x = self.tanh(x)
+        return x
+
+@persistence.persistent_class
+class Discriminator(torch.nn.Module):
+    def __init__(self,
+        img_resolution      = 256,                 # Input resolution.
+        img_channels        = 3,                   # Number of input color channels.
+        mask_channels       = 1,                   # Number of input color channels.
+        architecture        = 'resnet', # Architecture: 'orig', 'skip', 'resnet'.
+        channel_base        = 32768,    # Overall multiplier for the number of channels.
+        channel_max         = 512,      # Maximum number of channels in any layer.
+        num_fp16_res        = 0,        # Use FP16 for the N highest resolutions.
+        conv_clamp          = None,     # Clamp the output of convolution layers to +-X, None = disable clamping.
+        block_kwargs        = {},       # Arguments for DiscriminatorBlock.
+        mapping_kwargs      = {},       # Arguments for MappingNetwork.
+        epilogue_kwargs     = {},       # Arguments for DiscriminatorEpilogue.
+    ):
+        super().__init__()
+        # self.SRnet = MiddleModule(img_resolution=img_resolution, img_channels=img_channels)
+        self.Mnet = DualDiscriminator(
+            img_resolution=img_resolution,
+            img_channels=img_channels,
+            mask_channels=mask_channels,
+            architecture=architecture,
+            channel_base=channel_base,
+            channel_max=channel_max,
+            num_fp16_res=num_fp16_res,
+            conv_clamp=conv_clamp,
+            block_kwargs=block_kwargs,
+            mapping_kwargs=mapping_kwargs,
+            epilogue_kwargs=epilogue_kwargs
+        )
+
+        self.Snet = DualDiscriminator(
+            img_resolution=32,
+            img_channels=img_channels,
+            mask_channels=mask_channels,
+            architecture=architecture,
+            channel_base=channel_base,
+            channel_max=channel_max,
+            num_fp16_res=num_fp16_res,
+            conv_clamp=conv_clamp,
+            single=True,
+            block_kwargs=block_kwargs,
+            mapping_kwargs=mapping_kwargs,
+            epilogue_kwargs=epilogue_kwargs
+        )
+
+
+    def forward(self, img, mask, bbox, **block_kwargs):
+        # img = self.SRnet(img)
+        d1 = self.Mnet(img = img, mask = mask, **block_kwargs)
+        samples = img_resampler(img, bbox, resample_num=16) # (B*16, C, H, W)
+        d2 = self.Snet(img=samples, **block_kwargs).view(img.shape[0], 16, 1).mean(1)
+        return d1, d2
 
 if __name__ == "__main__":
-    device = torch.device('cuda', 0)
-    gen = SimGenerator().train().requires_grad_(True)
-    z = torch.randn(4, 512)
-    bbox = torch.rand(4, 128, 4)
-    img, mask, ws, sin_m = gen(z, bbox)
-    # D = DualDiscriminator().train().requires_grad_(True)
-    # res = D(img, mask)
-    a, b = torch.autograd.grad(outputs=[img.sum(), mask.sum()], inputs=[ws, sin_m], create_graph=True, only_inputs=True)
-    ppl_a = a.square().sum(2).mean(1).sqrt()
-    ppl_b = b.square().sum([1, 2, 3]).sqrt()
-    print(ppl_a, ppl_b)
-    (ppl_a + ppl_b).mean().backward()
-    # b, c = torch.autograd.grad(outputs=[res.sum()], inputs=[img, mask], create_graph=True, only_inputs=True)
-    # r1_b = b.square().sum([1,2,3])
-    # r1_c = c.square().sum([1,2,3])
-    # (r1_b + r1_c).mean().backward()
+    x = torch.randn([4, 1, 256, 256])
+    net = MiddleModule()
+    print(net)
+    out = net(x)
+    print("res:", out.shape)

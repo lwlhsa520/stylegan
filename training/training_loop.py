@@ -72,6 +72,7 @@ def training_loop(
     data_loader_kwargs      = {},       # Options for torch.utils.data.DataLoader.
     G_kwargs                = {},       # Options for generator network.
     D_kwargs                = {},       # Options for discriminator network.
+    ema_kwargs                = {},       # Options for discriminator network.
     G_opt_kwargs            = {},       # Options for generator optimizer.
     D_opt_kwargs            = {},       # Options for discriminator optimizer.
     augment_kwargs          = None,     # Options for augmentation pipeline. None = disable.
@@ -94,7 +95,7 @@ def training_loop(
     kimg_per_tick           = 4,        # Progress snapshot interval.
     image_snapshot_ticks    = 50,       # How often to save image snapshots? None = disable.
     network_snapshot_ticks  = 50,       # How often to save network snapshots? None = disable.
-    bbox_dim                = 128,
+    bbox_dim                = 256,
     resume_pkl              = None,     # Network pickle to resume training from.
     cudnn_benchmark         = True,     # Enable torch.backends.cudnn.benchmark?
     allow_tf32              = False,    # Enable torch.backends.cuda.matmul.allow_tf32 and torch.backends.cudnn.allow_tf32?
@@ -134,6 +135,8 @@ def training_loop(
     G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     G_ema = copy.deepcopy(G).eval()
+    #G_ema.G = copy.deepcopy(G).eval()
+    #G_ema.SR = copy.deepcopy(D.SRnet).eval()
     Perceptual = Perceptual_loss134().eval().to(device)
     # Resume from existing pickle.
     if (resume_pkl is not None) and (rank == 0):
@@ -146,9 +149,9 @@ def training_loop(
     # Print network summary tables.
     if rank == 0:
         z = torch.empty([batch_gpu, G.z_dim], device=device)
-        bbox = torch.rand([batch_gpu, G.bbox_dim, 4],device=device)
+        bbox = torch.from_numpy(training_set[0][2]).unsqueeze(0).repeat(batch_gpu, 1, 1).to(device)
         img, mask, _, _, _ = misc.print_module_summary(G, [z, bbox])
-        misc.print_module_summary(D, [img, mask])
+        misc.print_module_summary(D, [img, mask, bbox])
 
     # Setup augmentation.
     if rank == 0:
@@ -165,7 +168,8 @@ def training_loop(
     if rank == 0:
         print(f'Distributing across {num_gpus} GPUs...')
     ddp_modules = dict()
-    for name, module in [('G', G), ('D', D), (None, G_ema), ('augment_pipe', augment_pipe), ('P', Perceptual)]:
+    # for name, module in [('G', G), ('Dsr', D.SRnet), ('Dm', D.Mnet), (None, G_ema), ('augment_pipe', augment_pipe), ('P', Perceptual)]:
+    for name, module in [('G', G), ('Ds', D.Snet),  ('Dm', D.Mnet),  (None, G_ema), ('augment_pipe', augment_pipe), ('P', Perceptual)]:
         if (num_gpus > 1) and (module is not None) and len(list(module.parameters())) != 0:
             module.requires_grad_(True)
             module = torch.nn.parallel.DistributedDataParallel(module, device_ids=[device], broadcast_buffers=False)
@@ -297,10 +301,16 @@ def training_loop(
             if ema_rampup is not None:
                 ema_nimg = min(ema_nimg, cur_nimg * ema_rampup)
             ema_beta = 0.5 ** (batch_size / max(ema_nimg, 1e-8))
+
             for p_ema, p in zip(G_ema.parameters(), G.parameters()):
                 p_ema.copy_(p.lerp(p_ema, ema_beta))
             for b_ema, b in zip(G_ema.buffers(), G.buffers()):
                 b_ema.copy_(b)
+
+            # for p_ema, p in zip(G_ema.SR.parameters(), D.SRnet.parameters()):
+            #     p_ema.copy_(p.lerp(p_ema, ema_beta))
+            # for b_ema, b in zip(G_ema.SR.buffers(), D.SRnet.buffers()):
+            #     b_ema.copy_(b)
 
         # Update state.
         cur_nimg += batch_size

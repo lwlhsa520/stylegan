@@ -273,9 +273,16 @@ class Dataset(torch.utils.data.Dataset):
         while True:
             image, mask, bbox = self.__getitem2__(idx)
             if len(bbox) != 0:
+
+                _add_nums = (self.bbox_dim - len(bbox)) if len(bbox) < self.bbox_dim else 0
+                if _add_nums > 0:
+                    _add_bbox = np.zeros([_add_nums, 4], dtype=float)
+                    bbox = np.concatenate([bbox, _add_bbox])
+                bbox = bbox[:self.bbox_dim]
+
                 return image, mask, bbox
 
-            idx = random.randint(0, self.__len__())
+            idx = random.randint(0, self.__len__()-1)
 
     def __getitem2__(self, idx):
         image = self._load_raw_image(self._raw_idx[idx])
@@ -294,20 +301,10 @@ class Dataset(torch.utils.data.Dataset):
         bbox = bbox[((bbox[:, 2] > 0.05) * (bbox[:, 3] > 0.05))]
         # bbox = xywh2x0y0wh(bbox)
 
-        _add_nums = (self.bbox_dim - len(bbox)) if len(bbox) < self.bbox_dim else 0
-        if _add_nums > 0:
-            _add_bbox = np.zeros([_add_nums, 4], dtype=float)
-            bbox = np.concatenate([bbox, _add_bbox])
-        bbox = bbox[:self.bbox_dim]
-
         image = image.transpose(2, 0, 1)
-        # new_image = new_image.transpose(2, 0, 1)
         mask = mask.transpose(2, 0, 1)
-        # new_mask = new_mask.transpose(2, 0, 1)
         image = np.ascontiguousarray(image)
-        # new_image = np.ascontiguousarray(new_image)
         mask = np.ascontiguousarray(mask)
-        # new_mask = np.ascontiguousarray(new_mask)
 
         return image, mask, bbox
 
@@ -463,10 +460,14 @@ class ImageFolderDataset(Dataset):
     def _load_raw_bbox(self, raw_idx):
         fname = self._image_fnames[raw_idx] + ".txt"
         bbox = np.loadtxt(os.path.join(self._bbox_path, fname))
-        bbox = np.expand_dims(bbox, axis=0) if bbox.ndim == 1 else bbox
+        if bbox.ndim == 1:
+            bbox = bbox[np.newaxis, :]
+
+        if bbox.shape[1] !=5:
+            bbox = np.zeros([0, 5])
 
         bbox = bbox[((bbox[:, 3] > 0) * (bbox[:, 4] > 0))]
-        bbox = np.expand_dims(bbox, axis=0) if bbox.ndim == 1 else bbox
+
         return bbox[:, 1:]
 
     def _load_raw_labels(self):
@@ -485,26 +486,19 @@ class ImageFolderDataset(Dataset):
 
 #----------------------------------------------------------------------------
 if __name__ == "__main__":
-    path = "../../data/dataset"
+    path = "../../data/dataset4"
 
     data = ImageFolderDataset(path=path)
-    image, label, mask, bbox, ps = data[0]
+    image, mask, bbox = data[0]
 
-    print(image.shape, mask.shape, ps)
-    PIL.Image.fromarray(image[0]).convert('L').save('img.png')
-    PIL.Image.fromarray(mask[0]).convert('L').save('mask.png')
+    PIL.Image.fromarray(image[0]).convert('L').save('./image.png')
+    PIL.Image.fromarray(mask[0]).convert('L').save('./mask.png')
+    bbox = xywh2x0y0x1y1(bbox)*255
+    for box in bbox:
+        print(int(box[0]), int(box[1]), int(box[2]), int(box[3]))
+        x0, y0, x1, y1 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+        cv2.rectangle(image[0], (y0, x0), (y1, x1), (255, 0, 0))
 
-    image2 = image.copy()
-    color = (255, 0, 0)
-    # b = bbox[0]
-    for i, b in enumerate(bbox):
-        if i == 0:
-            color = (255, 12, 32)
-        else:
-            color = (255, 0, 0)
-        x0, y0, w, h = b*(image.shape[1]-1)
-        x0, y0, w, h = int(x0), int(y0), int(w), int(h)
-        x1, y1 = x0+w, y0+h
-        cv2.rectangle(image2[0], (x0, y0), (x1, y1), color )
-    PIL.Image.fromarray(image2[0]).convert('L').save('img2.png')
+    cv2.imwrite('bbox.png', image[0])
+
 

@@ -5,7 +5,7 @@
       <paths name="bdbd@172.18.13.75:22 password">
         <serverdata>
           <mappings>
-            <mapping local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/home/bdbd/coding/stylegan" local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>
